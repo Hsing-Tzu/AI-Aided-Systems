@@ -1,0 +1,82 @@
+/* 全局樣式 */
+body {
+  font-family: Arial, sans-serif;
+  margin: 0;
+  padding: 0;
+  background-color: #f9f9f9;
+  color: #333;
+}
+
+/* 容器樣式 */
+div {
+  margin: 20px auto;
+  max-width: 800px;
+  padding: 20px;
+  background-color: #fff;
+  border-radius: 8px;
+  box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+}
+
+/* 標題樣式 */
+h2 {
+  text-align: center;
+  color: #4caf50;
+}
+
+h3 {
+  margin-top: 20px;
+  color: #333;
+}
+
+/* 按鈕樣式 */
+button {
+  background-color: #4caf50;
+  color: white;
+  border: none;
+  padding: 10px 20px;
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 16px;
+}
+
+button:disabled {
+  background-color: #ccc;
+  cursor: not-allowed;
+}
+
+button:hover:not(:disabled) {
+  background-color: #45a049;
+}
+
+/* 輸入框樣式 */
+input[type="file"],
+input[type="text"] {
+  width: 100%;
+  padding: 10px;
+  margin: 10px 0;
+  border: 1px solid #ddd;
+  border-radius: 4px;
+  box-sizing: border-box;
+}
+
+/* 對話框樣式 */
+div[style*="overflowY: scroll"] {
+  background-color: #f1f1f1;
+  border-radius: 4px;
+  padding: 10px;
+}
+
+div[style*="overflowY: scroll"] p {
+  margin: 0;
+  padding: 5px;
+  border-bottom: 1px solid #ddd;
+}
+
+div[style*="overflowY: scroll"] p:last-child {
+  border-bottom: none;
+}
+
+/* 使用者與回應訊息樣式 */
+strong {
+  color: #4caf50;
+}
