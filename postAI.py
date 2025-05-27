@@ -3,7 +3,7 @@ from playwright.async_api import async_playwright
 
 # 存儲登入狀態的檔案
 STORAGE_STATE_PATH = "medium_login_state.json"
-MEDIUM_POST_PATH = "./temp/medium_post.txt"  # medium_post 文件路徑
+MEDIUM_POST_PATH = "./temp/medium_post.md"  # medium_post 文件路徑
 
 async def save_login_state():
     async with async_playwright() as p:
@@ -66,12 +66,23 @@ async def post_on_medium():
         await page.wait_for_timeout(5000)
         # 填寫文章標題
         await page.locator("h3.graf--title span.defaultValue").click()
-        await page.keyboard.type(title, delay=10)
-        await page.wait_for_timeout(5000)
+        await page.keyboard.type("A", delay=10)  # 先輸入一個字母 A
+        await page.keyboard.type(title[0], delay=10)  # 輸入標題的第一個字
+        await page.keyboard.press("ArrowLeft")  # 將光標移到字母 A 的右側
+        await page.keyboard.press("Backspace")  # 刪除第一個字母 A
+        await page.keyboard.press("ArrowRight") 
+        for char in title[1:]:  # 輸入標題的其餘部分
+            await page.keyboard.type(char, delay=10)
+
         # 填寫文章內容
         await page.locator("p.graf--p span.defaultValue").click()
-        await page.keyboard.type(content, delay=10)
-
+        await page.keyboard.type("A", delay=10)  # 先輸入一個字母 A
+        await page.keyboard.type(content[0], delay=10)  # 輸入內容的第一個字
+        await page.keyboard.press("ArrowLeft")  # 將光標移到字母 A 的右側
+        await page.keyboard.press("Backspace")  # 刪除第一個字母 A
+        await page.keyboard.press("ArrowRight") 
+        for char in content[1:]:  # 輸入內容的其餘部分
+            await page.keyboard.type(char, delay=10)
         # 等待 5 秒，確保內容輸入完成
         await page.wait_for_timeout(5000)
 
@@ -79,30 +90,19 @@ async def post_on_medium():
         await page.reload()
         await page.wait_for_timeout(5000)
 
-        # 等待發佈按鈕可用
-        publish_button = await page.wait_for_selector("button[data-action='show-prepublish']", timeout=100000)
+        # 等 Publish 按鈕真正可點
+        await page.wait_for_selector('button[data-action="show-prepublish"]', timeout=60000)
+        btn = await page.query_selector('button[data-action="show-prepublish"]')
+        await page.wait_for_function("b => !b.disabled", arg=btn, timeout=60000)
+        await btn.click()
 
-        # 檢查按鈕是否啟用
-        is_enabled = await page.evaluate("(btn) => !btn.disabled", publish_button)
+        # 點 Publish now
+        await page.wait_for_selector("button:has-text('Publish now')", timeout=60000)
+        await page.click("button:has-text('Publish now')")
+        await page.wait_for_timeout(5000)  
+        await page.wait_for_load_state("networkidle")
+        print(" Medium post finished")
         
-        if not is_enabled:
-            print("⚠️ Publish 按鈕仍不可用，嘗試手動點擊")
-            await publish_button.click()
-        else:
-            print("✅ Publish 按鈕可用，進行發佈")
-            await publish_button.click()
-
-        # 確保 Publish now 按鈕可見
-        await page.wait_for_timeout(5000)  # 等待 5 秒，確保按鈕載入
-        publish_now_button = page.locator("button:has-text('Publish now')")
-
-        if await publish_now_button.is_visible():
-            await publish_now_button.click()
-            print("✅ 成功點擊 'Publish now' 按鈕，等待發佈...")
-            await page.wait_for_timeout(10000)  # 等待 10 秒，確保 Medium 完成發佈
-            print("✅ 文章應該已成功發佈！")
-        else:
-            print("❌ 找不到 'Publish now' 按鈕，文章可能仍然是草稿！")
 
 
 if __name__ == "__main__":

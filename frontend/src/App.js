@@ -10,6 +10,7 @@ const WebSocketChat = () => {
   const [inputMessage, setInputMessage] = useState("");
   const [shortReview, setShortReview] = useState("");
   const [mode, setMode] = useState("upload");
+  const [generating, setGenerating] = useState(false); // 控制再生成按鈕 loading
 
   useEffect(() => {
     return () => {
@@ -49,55 +50,19 @@ const WebSocketChat = () => {
 
       console.log("上傳成功:", result.file_path);
 
-      // 建立 WebSocket 連線
-      const socket = new WebSocket("ws://localhost:8000/ws");
-
-      socket.onopen = () => {
-        console.log("WebSocket 連線成功");
-        setConnected(true);
-        socket.send(JSON.stringify({ message: "開始處理 CSV 文件" }));
-      };
-
-      socket.onmessage = async (event) => {
-        try {
-          const newMessage = JSON.parse(event.data);
-
-          if (newMessage.content) {
-            const evaluationResponse = await fetch("http://localhost:8000/evaluate_review", {
-              method: "POST",
-              headers: {
-                "Content-Type": "application/json",
-              },
-              body: JSON.stringify({ generated_review: newMessage.content }),
-            });
-
-            const evaluationResult = await evaluationResponse.json();
-            if (evaluationResult.error) {
-              console.error("評分失敗:", evaluationResult.error);
-              alert("評分失敗：" + evaluationResult.error);
-              return;
-            }
-
-            newMessage.evaluation = evaluationResult.evaluation;
-          }
-
-          setMessages((prev) => [...prev, newMessage]);
-        } catch (error) {
-          console.error("解析 WebSocket 訊息時發生錯誤", error);
-        }
-      };
-
-      socket.onerror = (error) => {
-        console.error("WebSocket 發生錯誤", error);
-        alert("WebSocket 連線錯誤");
-      };
-
-      socket.onclose = () => {
-        console.log("WebSocket 連線已關閉");
-        setConnected(false);
-      };
-
-      setWs(socket);
+      // 顯示統整後的完整標題和文章
+      if (result.combined_title && result.combined_content) {
+        setMessages((prev) => [
+          ...prev,
+          {
+            title: result.combined_title,
+            content: result.combined_content,
+          },
+        ]);
+      } else {
+        console.warn("未收到統整後的內容或標題");
+        alert("未收到有效的統整內容或標題，請檢查後端日誌以獲取更多資訊。");
+      }
     } catch (error) {
       console.error("上傳失敗", error);
       alert("檔案上傳失敗，請稍後再試");
@@ -161,13 +126,12 @@ const WebSocketChat = () => {
         alert("評分失敗：" + evaluationResult.error);
         return;
       }
-
       setMessages((prev) => [
         ...prev,
         {
           user_message: shortReview,
           title: result.title, // 新增標題
-          response: result.content,
+          content: result.content,
           evaluation: evaluationResult.evaluation,
         },
       ]);
@@ -178,7 +142,38 @@ const WebSocketChat = () => {
     } finally {
       setLoading(false);
     }
+
   };
+
+  const handleRefine = async (article, instruction) => {
+    if (!instruction.trim()) {
+      alert("請輸入指令");
+      return;
+    }
+    setGenerating(true);
+    try {
+      const res = await fetch("http://localhost:8000/refine_review", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ article, instruction })
+      });
+      const data = await res.json();
+      if (data.error) throw new Error(data.error);
+
+      // 把新版本 push 進 messages
+      setMessages(prev => [...prev, {
+        title: data.title,
+        content: data.content,
+        instruction
+      }]);
+    } catch (err) {
+      alert("再生成失敗：" + err.message);
+    } finally {
+      setGenerating(false);
+    }
+  };
+
+
 
   const handlePostToMedium = async () => {
     if (messages.length === 0) {
@@ -187,7 +182,7 @@ const WebSocketChat = () => {
     }
 
     const latestMessage = messages[messages.length - 1];
-    if (!latestMessage.title || !latestMessage.response) {
+    if (!latestMessage.title || !latestMessage.content) { // 修正這裡的鍵名
       alert("最新的訊息沒有標題或內容資訊");
       return;
     }
@@ -202,7 +197,7 @@ const WebSocketChat = () => {
         },
         body: JSON.stringify({
           title: latestMessage.title,
-          content: latestMessage.response,
+          content: latestMessage.content, // 修正這裡的鍵名
         }),
       });
 
@@ -289,32 +284,26 @@ const WebSocketChat = () => {
         </div>
       )}
 
+      {/* 文章列表 + 再調整功能 */}
       <div
         style={{
-          maxHeight: "400px",
           overflowY: "scroll",
           border: "1px solid #ddd",
           padding: "10px",
           marginTop: "20px",
+          maxHeight: 400,
         }}
       >
-        {messages.map((msg, index) => (
-          <div key={index} style={{ marginBottom: "10px" }}>
-            {msg.user_message && (
-              <p>
-                <strong>使用者輸入：</strong> {msg.user_message}
+        {messages.map((msg, idx) => (
+          <div key={idx} style={{ marginBottom: 20 }}>
+            {msg.title && <h3><strong>標題：</strong> {msg.title}</h3>}
+            {msg.content && (
+              <p style={{ whiteSpace: "pre-wrap" }}>
+                <strong>內容：</strong> {msg.content}
               </p>
             )}
-            {msg.title && (
-              <p>
-                <strong>生成的標題：</strong> {msg.title}
-              </p>
-            )}
-            {msg.response && (
-              <p>
-                <strong>生成的內容：</strong> {msg.response}
-              </p>
-            )}
+
+            {/* --- 評分表（若有） --- */}
             {msg.evaluation && (
               <div>
                 <strong>評分結果：</strong>
@@ -364,23 +353,39 @@ const WebSocketChat = () => {
                 </table>
               </div>
             )}
-            {msg.search_results && Array.isArray(msg.search_results) && (
-              <div>
-                <strong>延伸閱讀：</strong>
-                <ul>
-                  {msg.search_results.map((result, idx) => (
-                    <li key={idx}>
-                      <a href={result.link} target="_blank" rel="noopener noreferrer">
-                        {result.title}
-                      </a>
-                    </li>
-                  ))}
-                </ul>
-              </div>
-            )}
+
+            {/* --- 再調整區塊 --- */}
+            <div style={{ marginTop: 12 }}>
+              <input
+                type="text"
+                value={msg.refineText || ""}          /* 個別訊息自己的指令文字 */
+                onChange={(e) => {
+                  const t = e.target.value;
+                  setMessages((prev) =>
+                    prev.map((m, i) =>
+                      i === idx ? { ...m, refineText: t } : m
+                    )
+                  );
+                }}
+                placeholder="輸入修改指令，如：改成更幽默"
+                style={{ width: "70%", padding: 8, marginRight: 8 }}
+              />
+              <button
+                onClick={() =>
+                  handleRefine(
+                    `${msg.title}\n\n${msg.content}`,
+                    msg.refineText || ""
+                  )
+                }
+                disabled={generating}
+              >
+                {generating ? "再生成中..." : "再生成"}
+              </button>
+            </div>
           </div>
         ))}
       </div>
+
 
       <button
         onClick={handlePostToMedium}

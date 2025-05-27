@@ -2,6 +2,8 @@ import asyncio
 import json
 import os
 import pandas as pd
+import re
+import subprocess
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
@@ -10,15 +12,10 @@ from bs4 import BeautifulSoup
 import io
 from google import genai  # 新增 genai 客戶端
 from fastapi import HTTPException
-from playwright.async_api import async_playwright
-
-STORAGE_STATE_PATH = "medium_login_state.json"
 
 # 設定 Windows asyncio 事件迴圈 (避免 WindowsProactorEventLoopPolicy 錯誤)
 if os.name == "nt":
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
-
-# 讀取環境變數
 load_dotenv()
 
 # 初始化 FastAPI 應用程式
@@ -84,49 +81,81 @@ class AssistantAgent:
         elif isinstance(messages, dict) and "content" in messages:
             messages = [messages["content"]]
 
-        return await gemini_client.generate_response(messages)
+        response = await gemini_client.generate_response(messages)
 
+        # 檢查返回內容是否為空
+        if not response.strip():
+            print("模型返回的內容為空")
+            return '{"title": "未能生成標題", "content": "未能生成內文"}'
+
+        return response
+
+# 自定義 AggregatorAgent        
+
+class AggregatorAgent:
+    async def summarize_results(self, results):
+        """
+        將所有批次的結果丟給模型，讓模型進行統整。
+        """
+        combined_content = []
+        for result in results:
+            try:
+                # 檢查內容是否為空
+                if not result.get("content"):
+                    print("批次內容為空，跳過該批次")
+                    continue
+
+                # 移除多餘的 Markdown 標記
+                cleaned_content = result["content"].replace("```json", "").replace("```", "").strip()
+                cleaned_content = re.sub(r"[\x00-\x1F\x7F]", "", cleaned_content)
+
+                # 嘗試解析每個批次的 JSON 格式內容
+                if cleaned_content:  # Ensure cleaned_content is not empty
+                    parsed_content = json.loads(cleaned_content)
+                    combined_content.append(parsed_content.get("content", ""))
+                else:
+                    print("清理後的內容為空，跳過該批次")
+            except (json.JSONDecodeError, KeyError) as e:
+                print(f"解析批次內容失敗: {e}")
+                continue
+
+        # 如果沒有有效內容，返回默認值
+        if not combined_content:
+            return "未能生成標題", "未能生成內文"
+
+        # 將所有內容合併為一個輸入
+        input_content = "\n\n".join(combined_content)
+
+        # 構建統整的提示
+        prompt = (
+            f"以下是多個批次的旅遊心得內容，請根據這些內容生成一篇統整的完整文章，避免使用markdown格式，，並以 JSON 格式返回：\n"
+            "{\n"
+            '  "title": "統整後的標題",\n'
+            '  "content": "統整後的完整內文"\n'
+            "}\n"
+            "請確保文章內容流暢且具有吸引力，並包含所有重要資訊。\n\n"
+            f"{input_content}"
+        )
+
+        # 使用 AssistantAgent 生成統整結果
+        summarized_result = await assistant_agent.generate_review([{"role": "user", "content": prompt}])
+
+        # 移除多餘的 Markdown 標記
+        summarized_result = re.sub(r"```json\s*|\s*```", "", summarized_result).strip()
+
+        # 嘗試解析模型的輸出
+        try:
+            summarized_data = json.loads(summarized_result)
+            return summarized_data.get("title", "未能生成標題"), summarized_data.get("content", "未能生成內文")
+        except json.JSONDecodeError:
+            print(f"統整結果解析失敗: {summarized_result}")
+            return "統整失敗", "模型返回的內容無法解析，請檢查輸入格式或模型回應。"
+ 
 # 初始化 Agents
 web_surfer_agent = WebSurferAgent()
 assistant_agent = AssistantAgent()
+aggregator_agent = AggregatorAgent()
 
-# 處理 CSV 批次數據
-async def process_chunk(chunk, start_idx, total_records, websocket: WebSocket, conversation_history: list):
-    """
-    處理 CSV 文件的每個批次數據，並通過 WebSocket 發送結果。
-    """
-    chunk_data = chunk.to_dict(orient="records")
-    prompt = (
-        f"目前正在處理第 {start_idx} 至 {start_idx + len(chunk) - 1} 筆資料（共 {total_records} 筆）。\n"
-        f"以下為該批次旅遊回顧資料:\n{chunk_data}\n\n"
-        "請根據以上旅遊回顧，生成完整的旅遊心得，並包括以下要點：\n"
-        "  1. 整理並撰寫流暢的旅遊回顧。\n"
-        "  2. 使用 WebSurferAgent 搜尋相關景點、美食、文化背景的資訊，並整理成「延伸閱讀」段落。\n"
-        "  3. 讓內容自然流暢，確保資訊準確且易於閱讀。\n"
-    )
-
-    # 記錄使用者的批次請求到對話歷史
-    conversation_history.append({"role": "user", "content": prompt})
-
-    # 使用 AssistantAgent 生成回顧
-    review = await assistant_agent.generate_review(conversation_history)
-
-    # 記錄 Assistant 的回覆到對話歷史
-    conversation_history.append({"role": "assistant", "content": review})
-
-    # 使用 WebSurferAgent 搜尋延伸閱讀
-    search_results = await web_surfer_agent.search("旅遊景點")
-
-    # 構建回傳的訊息
-    message_data = {
-        "batch_start": start_idx,
-        "batch_end": start_idx + len(chunk) - 1,
-        "content": review,
-        "search_results": search_results,
-    }
-
-    # 通過 WebSocket 發送結果
-    await websocket.send_text(json.dumps(message_data))
 async def process_chunk(chunk, start_idx, total_records, websocket: WebSocket, conversation_history: list):
     """
     處理 CSV 文件的每個批次數據，並通過 WebSocket 發送結果。
@@ -139,6 +168,9 @@ async def process_chunk(chunk, start_idx, total_records, websocket: WebSocket, c
         "  1. 整理並撰寫流暢的旅遊回顧。\n"
         "  2. 使用 WebSurferAgent 搜尋相關景點、美食、文化背景的資訊，並整理成「延伸閱讀」段落。\n"
         "  3. 讓內容自然流暢，確保資訊準確且易於閱讀。\n"
+        "最終僅以 JSON 格式回傳：\n"
+        "{\n  \"title\": \"文章標題\",\n  \"content\": \"完整 Markdown 內文(含延伸閱讀)\"\n}\n"
+        "注意：不要回任何額外文字。\n"
     )
 
     # 記錄使用者的批次請求到對話歷史
@@ -164,9 +196,10 @@ async def process_chunk(chunk, start_idx, total_records, websocket: WebSocket, c
     # 通過 WebSocket 發送結果
     if websocket:
         await websocket.send_text(json.dumps(message_data))
+    return message_data
 
 @app.post("/upload")
-async def upload_file(file: UploadFile = File(...), websocket: WebSocket = None):
+async def upload_file(file: UploadFile = File(...)):
     """
     處理文件上傳，並將文件分塊處理後傳遞給模型。
     """
@@ -187,12 +220,26 @@ async def upload_file(file: UploadFile = File(...), websocket: WebSocket = None)
         chunk_size = 10  # 每次處理 10 條數據
         total_records = len(df)
         conversation_history = []  # 用於存儲對話歷史記錄
+        results = []  # 用於存儲所有批次的處理結果
 
         for start_idx in range(0, total_records, chunk_size):
             chunk = df.iloc[start_idx:start_idx + chunk_size]
-            await process_chunk(chunk, start_idx, total_records, websocket, conversation_history)
+            # 處理每個批次數據
+            result = await process_chunk(chunk, start_idx, total_records, None, conversation_history)
+            results.append(result)
+            print("Processing Results:", results)
 
-        return {"filename": file.filename, "file_path": file_path}
+        # 使用 AggregatorAgent 統整所有批次的結果
+        final_title, combined_content = await aggregator_agent.summarize_results(results)
+
+        # 返回處理結果
+        return {
+            "filename": file.filename,
+            "file_path": file_path,
+            "results": results,
+            "combined_title": final_title,  # 返回統整後的標題
+            "combined_content": combined_content,  # 返回統整後的完整文章
+        }
     except Exception as e:
         return {"error": f"文件上傳失敗: {str(e)}"}
 
@@ -294,7 +341,28 @@ async def generate_review_endpoint(input_data: dict):
     except Exception as e:
         return {"error": f"生成文章失敗: {str(e)}"}
     
-import re
+@app.post("/refine_review")
+async def refine_review_endpoint(data: dict):
+    """接收舊文章與追加指令，回傳重寫後的文章"""
+    original = data.get("article", "")
+    instruction = data.get("instruction", "")
+    if not original or not instruction:
+        return {"error": "缺少 article 或 instruction"}
+    
+    prompt = (
+        f"下面是一篇旅遊文章，接著是一句修改指令。"
+        f"請依指令重寫全文並只回 JSON：\n"
+        "{\n  \"title\": \"新標題\",\n  \"content\": \"新內文\"\n}\n\n"
+        f"--- 文章開始 ---\n{original}\n--- 文章結束 ---\n\n"
+        f"### 指令：{instruction}"
+    )
+    conversation = [{"role": "user", "content": prompt}]
+    new_article = await assistant_agent.generate_review(conversation)
+    new_article = re.sub(r"```json\s*|\s*```", "", new_article)  # 清掉 code block
+    try:
+        return json.loads(new_article)
+    except json.JSONDecodeError:
+        return {"error": "模型輸出無法解析", "raw": new_article}
 
 @app.post("/evaluate_review")
 async def evaluate_review_endpoint(input_data: dict):
@@ -335,12 +403,10 @@ async def evaluate_review_endpoint(input_data: dict):
     except Exception as e:
         return {"error": f"評分失敗: {str(e)}"}
 
-import subprocess
-
 @app.post("/post_to_medium")
 async def post_to_medium(input_data: dict):
     """
-    使用已生成的標題和內容發佈到 Medium。
+    使用已生成的標題和 Markdown 格式內容發佈到 Medium。
     """
     try:
         # 從輸入中獲取標題和內容
@@ -352,8 +418,8 @@ async def post_to_medium(input_data: dict):
         # 確保臨時目錄存在
         os.makedirs("./temp", exist_ok=True)
 
-        # 更新 medium_post.txt 文件
-        medium_post_path = "./temp/medium_post.txt"
+        # 保存 Markdown 格式內容到 medium_post.md 文件
+        medium_post_path = "./temp/medium_post.md"
         with open(medium_post_path, "w", encoding="utf-8") as f:
             f.write(f"# {title}\n\n{content}")
 
@@ -361,24 +427,41 @@ async def post_to_medium(input_data: dict):
         print(f"使用的標題: {title}")
         print(f"使用的內容: {content}")
 
-        # 執行 postAI.py 腳本
-        process = subprocess.run(
-            [
-                "cmd.exe", "/c", 
-                "D:\\AI-Aided-Systems\\AAS-venv\\Scripts\\activate && python postAI.py"
-            ],
+        # 使用虛擬環境中的 Python 解釋器執行 postAI.py
+        python_executable = "D:\\AI-Aided-Systems\\AAS-venv\\Scripts\\python.exe"
+        log_file = open("./temp/postAI_log.txt", "w", encoding="utf-8")
+
+        process = subprocess.Popen(
+            [python_executable, "-u", "postAI.py"],
             cwd="D:\\AI-Aided-Systems",
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True
+            env=os.environ.copy(),
+            stdout=log_file,
+            stderr=subprocess.STDOUT,   # stderr 也併到同一檔
         )
 
+        try:
+            process.wait(timeout=900)   # 15 分鐘
+        except subprocess.TimeoutExpired:
+            process.kill()
+            log_file.close()
+            raise HTTPException(status_code=500, detail="postAI.py 執行逾時（900 秒）")
+
+        log_file.close()
+
+        # 回看內容
+        with open("./temp/postAI_log.txt", encoding="utf-8") as f:
+            full_log = f.read()
+        print(full_log)      # 也讓 FastAPI console 看得到
+
+        # 檢查執行結果
         if process.returncode != 0:
+            print(f"執行 postAI.py 失敗，錯誤輸出: {process.stderr}")
             raise HTTPException(
                 status_code=500,
                 detail=f"執行 postAI.py 失敗: {process.stderr}"
             )
 
+        print(f"執行 postAI.py 成功，輸出: {process.stdout}")
         return {"message": "文章已成功發佈到 Medium！", "output": process.stdout}
 
     except Exception as e:
